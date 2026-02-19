@@ -1,0 +1,450 @@
+"""BetterBT — Team Calendar Dashboard
+
+Connects to Outlook calendars and shows how busy the team is
+on a weekly basis over the coming months.
+
+Run with: streamlit run app.py
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+from datetime import datetime, timedelta
+
+from config import AzureConfig
+from outlook_client import OutlookClient
+from data_processor import load_calendar_data, query_availability, parse_availability_query
+
+# ---------------------------------------------------------------------------
+# Page config
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="BetterBT — Team Calendar",
+    page_icon="📅",
+    layout="wide",
+)
+
+st.title("BetterBT — Team Calendar")
+st.caption("Weekly staffing view from Outlook calendars")
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.header("Settings")
+
+    months_ahead = st.slider("Months to look ahead", 1, 6, 3)
+    hours_per_day = st.number_input("Work hours per day", 4, 12, 8)
+
+    start_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    end_date = start_date + timedelta(weeks=months_ahead * 4 + 1)
+
+    st.divider()
+
+    outlook_ok = all([AzureConfig.TENANT_ID, AzureConfig.CLIENT_ID, AzureConfig.CLIENT_SECRET])
+    st.subheader("Connection")
+    if outlook_ok:
+        st.success("Outlook credentials configured")
+    else:
+        st.error("Outlook not configured")
+
+    if AzureConfig.OUTLOOK_USERS:
+        st.write(f"**{len(AzureConfig.OUTLOOK_USERS)} staff** tracked:")
+        for u in AzureConfig.OUTLOOK_USERS:
+            st.write(f"- {u}")
+    else:
+        st.warning("No staff emails in OUTLOOK_USERS")
+
+    st.divider()
+    refresh = st.button("Refresh Data", type="primary", use_container_width=True)
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+if not outlook_ok:
+    st.warning(
+        "Outlook credentials not configured. "
+        "Copy `.env.example` to `.env`, fill in your Azure app credentials "
+        "and staff emails, then restart."
+    )
+    st.stop()
+
+if not AzureConfig.OUTLOOK_USERS:
+    st.warning(
+        "No staff emails configured. Add a comma-separated list to "
+        "`OUTLOOK_USERS` in your `.env` file."
+    )
+    st.stop()
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=300, show_spinner="Fetching calendars...")
+def cached_load(_months, _hours_per_day):
+    s = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    e = s + timedelta(weeks=_months * 4 + 1)
+    client = OutlookClient()
+    return load_calendar_data(client, s, e, _hours_per_day)
+
+
+if refresh:
+    st.cache_data.clear()
+
+data = cached_load(months_ahead, hours_per_day)
+
+for err in data["errors"]:
+    st.error(err)
+
+weekly_df = data["weekly"]
+team_df = data["team_weekly"]
+staff_df = data["staff_summary"]
+staff_names, week_labels, heatmap_z = data["heatmap"]
+daily_df = data["daily"]
+
+if weekly_df.empty:
+    st.info("No calendar data returned. Verify credentials and staff list.")
+    st.stop()
+
+# ---------------------------------------------------------------------------
+# KPI row
+# ---------------------------------------------------------------------------
+num_weeks = len(team_df) if not team_df.empty else 0
+avg_util = team_df["avg_utilization"].mean() if not team_df.empty else 0
+total_booked = staff_df["total_booked"].sum() if not staff_df.empty else 0
+total_avail = staff_df["total_available"].sum() if not staff_df.empty else 0
+
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Staff", len(AzureConfig.OUTLOOK_USERS))
+k2.metric("Weeks Shown", num_weeks)
+k3.metric("Avg Team Utilization", f"{avg_util:.0f}%")
+k4.metric("Total Available Hours", f"{total_avail:,.0f}")
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Main content: two tabs
+# ---------------------------------------------------------------------------
+tab_team, tab_people, tab_finder = st.tabs(["Team Overview", "Individual Staff", "Availability Finder"])
+
+# ====== Tab 1: Team Overview ===============================================
+with tab_team:
+
+    # --- Team utilization trend line ---
+    st.subheader("Team Utilization by Week")
+    if not team_df.empty:
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=team_df["week_label"],
+            y=team_df["team_booked"],
+            name="Booked Hours",
+            marker_color="#636EFA",
+        ))
+        fig.add_trace(go.Bar(
+            x=team_df["week_label"],
+            y=team_df["team_available"],
+            name="Available Hours",
+            marker_color="#2ecc71",
+        ))
+        fig.add_trace(go.Scatter(
+            x=team_df["week_label"],
+            y=team_df["avg_utilization"],
+            name="Utilization %",
+            yaxis="y2",
+            mode="lines+markers",
+            line=dict(color="#e74c3c", width=2),
+            marker=dict(size=6),
+        ))
+        fig.update_layout(
+            barmode="stack",
+            yaxis=dict(title="Hours"),
+            yaxis2=dict(title="Utilization %", overlaying="y", side="right",
+                        range=[0, 100], showgrid=False),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            height=400,
+            margin=dict(l=0, r=0, t=30, b=0),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # --- Heatmap: person x week ---
+    st.subheader("Who's Busy When")
+    if staff_names and week_labels:
+        fig = go.Figure(data=go.Heatmap(
+            z=heatmap_z,
+            x=week_labels,
+            y=staff_names,
+            colorscale=[
+                [0, "#2ecc71"],      # 0% = green (free)
+                [0.5, "#f1c40f"],    # 50% = yellow
+                [0.8, "#e67e22"],    # 80% = orange
+                [1, "#e74c3c"],      # 100% = red (slammed)
+            ],
+            zmin=0,
+            zmax=100,
+            text=[[f"{v:.0f}%" for v in row] for row in heatmap_z],
+            texttemplate="%{text}",
+            colorbar_title="Util %",
+            hovertemplate="<b>%{y}</b><br>Week of %{x}<br>Utilization: %{z:.0f}%<extra></extra>",
+        ))
+        fig.update_layout(
+            height=max(300, len(staff_names) * 45 + 80),
+            margin=dict(l=0, r=0, t=10, b=0),
+            xaxis=dict(side="top"),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # --- Weekly detail table ---
+    with st.expander("Weekly numbers"):
+        if not team_df.empty:
+            display = team_df[[
+                "week_label", "team_booked", "team_capacity",
+                "team_available", "staff_count", "avg_utilization",
+            ]].copy()
+            display.columns = [
+                "Week Of", "Booked Hrs", "Capacity Hrs",
+                "Available Hrs", "Staff", "Avg Util %",
+            ]
+            st.dataframe(display, use_container_width=True, hide_index=True)
+
+
+# ====== Tab 2: Individual Staff ============================================
+with tab_people:
+
+    st.subheader("Staff Summary")
+
+    if not staff_df.empty:
+        # Overall bar chart
+        sorted_staff = staff_df.sort_values("avg_utilization", ascending=True)
+        fig = px.bar(
+            sorted_staff,
+            y="staff",
+            x="avg_utilization",
+            orientation="h",
+            color="avg_utilization",
+            color_continuous_scale=["#2ecc71", "#f1c40f", "#e74c3c"],
+            range_color=[0, 100],
+            labels={"avg_utilization": "Avg Utilization %", "staff": ""},
+        )
+        fig.add_vline(x=80, line_dash="dash", line_color="gray",
+                       annotation_text="80% target")
+        fig.update_layout(
+            height=max(300, len(sorted_staff) * 40),
+            margin=dict(l=0, r=0, t=30, b=0),
+            coloraxis_colorbar_title="Util %",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Summary table
+        display = staff_df[[
+            "staff", "total_booked", "total_capacity",
+            "total_available", "weeks", "avg_utilization",
+        ]].copy()
+        display.columns = [
+            "Staff", "Booked Hrs", "Capacity Hrs",
+            "Available Hrs", "Weeks", "Avg Util %",
+        ]
+        st.dataframe(display, use_container_width=True, hide_index=True)
+
+    # Per-person weekly breakdown
+    st.subheader("Weekly Breakdown by Person")
+
+    if not weekly_df.empty:
+        selected = st.selectbox(
+            "Select staff member",
+            options=sorted(weekly_df["staff"].unique()),
+        )
+        person_df = weekly_df[weekly_df["staff"] == selected]
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=person_df["week_label"],
+            y=person_df["booked_hrs"],
+            name="Booked",
+            marker_color="#636EFA",
+        ))
+        fig.add_trace(go.Bar(
+            x=person_df["week_label"],
+            y=person_df["available_hrs"],
+            name="Available",
+            marker_color="#2ecc71",
+        ))
+        fig.update_layout(
+            barmode="stack",
+            yaxis_title="Hours",
+            height=350,
+            margin=dict(l=0, r=0, t=30, b=0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        with st.expander(f"{selected} — weekly detail"):
+            detail = person_df[[
+                "week_label", "booked_hrs", "capacity_hrs",
+                "available_hrs", "utilization_pct",
+            ]].copy()
+            detail.columns = [
+                "Week Of", "Booked Hrs", "Capacity Hrs",
+                "Available Hrs", "Utilization %",
+            ]
+            st.dataframe(detail, use_container_width=True, hide_index=True)
+
+
+# ====== Tab 3: Availability Finder =========================================
+with tab_finder:
+
+    st.subheader("Availability Finder")
+    st.caption(
+        'Ask a question like **"Who has a full Thursday available in March?"** '
+        'or use the filters below.'
+    )
+
+    if daily_df.empty:
+        st.info("No daily availability data. Check calendar connections.")
+    else:
+        # --- Query box ---
+        query_text = st.text_input(
+            "Ask a question",
+            placeholder="e.g. Who has a full Thursday available in March?",
+            key="avail_query",
+        )
+
+        st.divider()
+
+        # --- Manual filters (always visible as an alternative) ---
+        available_months = sorted(daily_df["month"].unique(),
+                                  key=lambda m: list(daily_df[daily_df["month"] == m]["month_num"])[0])
+        available_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+
+        f1, f2, f3 = st.columns(3)
+        with f1:
+            filter_month = st.selectbox("Month", ["Any"] + available_months, key="f_month")
+        with f2:
+            filter_day = st.selectbox("Day of week", ["Any"] + available_days, key="f_day")
+        with f3:
+            filter_type = st.selectbox(
+                "Availability",
+                ["Full day free", "Half day+ free (4+ hrs)", "Any free time (1+ hrs)"],
+                key="f_type",
+            )
+
+        # Determine filters: query overrides manual if present
+        if query_text.strip():
+            parsed = parse_availability_query(query_text)
+            day_name = parsed["day_name"]
+            month_name = parsed["month_name"]
+            full_day = parsed["full_day"]
+            min_hrs = parsed["min_hours"]
+        else:
+            day_name = None if filter_day == "Any" else filter_day
+            month_name = None if filter_month == "Any" else filter_month
+            if filter_type == "Full day free":
+                full_day = True
+                min_hrs = None
+            elif filter_type.startswith("Half"):
+                full_day = False
+                min_hrs = 4
+            else:
+                full_day = False
+                min_hrs = 1
+
+        results = query_availability(daily_df, day_name=day_name, month_name=month_name,
+                                     full_day=full_day, min_available_hrs=min_hrs)
+
+        # --- Show what we searched for ---
+        search_desc_parts = []
+        if day_name:
+            search_desc_parts.append(f"**{day_name}s**")
+        else:
+            search_desc_parts.append("**any weekday**")
+        if month_name:
+            search_desc_parts.append(f"in **{month_name}**")
+        if full_day:
+            search_desc_parts.append("with a **full day** free")
+        elif min_hrs:
+            search_desc_parts.append(f"with **{min_hrs}+ hours** free")
+
+        st.markdown(f"Showing {' '.join(search_desc_parts)}:")
+
+        if results.empty:
+            st.warning("No results found. Try broadening your search.")
+        else:
+            # --- Summary: who has the most available days ---
+            st.subheader("Results Summary")
+            summary = results.groupby("staff").agg(
+                free_days=("date_str", "count"),
+                total_free_hrs=("available_hrs", "sum"),
+            ).reset_index().sort_values("free_days", ascending=False)
+            summary.columns = ["Staff", "Free Days", "Total Free Hours"]
+
+            s1, s2 = st.columns([1, 2])
+            with s1:
+                st.dataframe(summary, use_container_width=True, hide_index=True)
+            with s2:
+                fig = px.bar(
+                    summary.sort_values("Free Days", ascending=True),
+                    y="Staff",
+                    x="Free Days",
+                    orientation="h",
+                    color="Free Days",
+                    color_continuous_scale=["#e74c3c", "#f1c40f", "#2ecc71"],
+                    labels={"Free Days": "Available Days"},
+                )
+                fig.update_layout(
+                    height=max(250, len(summary) * 40),
+                    margin=dict(l=0, r=0, t=10, b=0),
+                    showlegend=False,
+                    coloraxis_showscale=False,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            # --- Calendar grid: person x date heatmap ---
+            st.subheader("Day-by-Day View")
+            grid_pivot = results.pivot_table(
+                index="staff", columns="date_str", values="available_hrs",
+                aggfunc="first",
+            )
+            # Keep dates in order
+            date_order = sorted(grid_pivot.columns.tolist())
+            grid_pivot = grid_pivot.reindex(columns=date_order)
+
+            # Make short date labels
+            date_labels = []
+            for d in date_order:
+                from datetime import datetime as dt
+                parsed_date = dt.strptime(d, "%Y-%m-%d")
+                date_labels.append(parsed_date.strftime("%b %d\n%a"))
+
+            fig = go.Figure(data=go.Heatmap(
+                z=grid_pivot.values.tolist(),
+                x=date_labels,
+                y=grid_pivot.index.tolist(),
+                colorscale=[
+                    [0, "#e74c3c"],      # 0 hrs = red (busy)
+                    [0.5, "#f1c40f"],    # 4 hrs = yellow
+                    [1, "#2ecc71"],      # 8 hrs = green (free)
+                ],
+                zmin=0,
+                zmax=hours_per_day,
+                text=[[f"{v:.0f}h" if not pd.isna(v) else "" for v in row]
+                      for row in grid_pivot.values],
+                texttemplate="%{text}",
+                colorbar_title="Free Hrs",
+                hovertemplate=(
+                    "<b>%{y}</b><br>%{x}<br>"
+                    "Available: %{z:.1f} hrs<extra></extra>"
+                ),
+            ))
+            fig.update_layout(
+                height=max(300, len(grid_pivot) * 45 + 80),
+                margin=dict(l=0, r=0, t=10, b=0),
+                xaxis=dict(side="top"),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # --- Detailed table ---
+            with st.expander("Full detail table"):
+                detail = results[[
+                    "date_str", "day_name", "staff", "booked_hrs",
+                    "available_hrs",
+                ]].copy()
+                detail.columns = ["Date", "Day", "Staff", "Booked Hrs", "Available Hrs"]
+                st.dataframe(detail, use_container_width=True, hide_index=True)
