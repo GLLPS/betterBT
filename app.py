@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 
 from config import AzureConfig
 from outlook_client import OutlookClient
-from data_processor import load_calendar_data
+from data_processor import load_calendar_data, query_availability, parse_availability_query
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -99,6 +99,7 @@ weekly_df = data["weekly"]
 team_df = data["team_weekly"]
 staff_df = data["staff_summary"]
 staff_names, week_labels, heatmap_z = data["heatmap"]
+daily_df = data["daily"]
 
 if weekly_df.empty:
     st.info("No calendar data returned. Verify credentials and staff list.")
@@ -123,7 +124,7 @@ st.divider()
 # ---------------------------------------------------------------------------
 # Main content: two tabs
 # ---------------------------------------------------------------------------
-tab_team, tab_people = st.tabs(["Team Overview", "Individual Staff"])
+tab_team, tab_people, tab_finder = st.tabs(["Team Overview", "Individual Staff", "Availability Finder"])
 
 # ====== Tab 1: Team Overview ===============================================
 with tab_team:
@@ -285,3 +286,165 @@ with tab_people:
                 "Available Hrs", "Utilization %",
             ]
             st.dataframe(detail, use_container_width=True, hide_index=True)
+
+
+# ====== Tab 3: Availability Finder =========================================
+with tab_finder:
+
+    st.subheader("Availability Finder")
+    st.caption(
+        'Ask a question like **"Who has a full Thursday available in March?"** '
+        'or use the filters below.'
+    )
+
+    if daily_df.empty:
+        st.info("No daily availability data. Check calendar connections.")
+    else:
+        # --- Query box ---
+        query_text = st.text_input(
+            "Ask a question",
+            placeholder="e.g. Who has a full Thursday available in March?",
+            key="avail_query",
+        )
+
+        st.divider()
+
+        # --- Manual filters (always visible as an alternative) ---
+        available_months = sorted(daily_df["month"].unique(),
+                                  key=lambda m: list(daily_df[daily_df["month"] == m]["month_num"])[0])
+        available_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+
+        f1, f2, f3 = st.columns(3)
+        with f1:
+            filter_month = st.selectbox("Month", ["Any"] + available_months, key="f_month")
+        with f2:
+            filter_day = st.selectbox("Day of week", ["Any"] + available_days, key="f_day")
+        with f3:
+            filter_type = st.selectbox(
+                "Availability",
+                ["Full day free", "Half day+ free (4+ hrs)", "Any free time (1+ hrs)"],
+                key="f_type",
+            )
+
+        # Determine filters: query overrides manual if present
+        if query_text.strip():
+            parsed = parse_availability_query(query_text)
+            day_name = parsed["day_name"]
+            month_name = parsed["month_name"]
+            full_day = parsed["full_day"]
+            min_hrs = parsed["min_hours"]
+        else:
+            day_name = None if filter_day == "Any" else filter_day
+            month_name = None if filter_month == "Any" else filter_month
+            if filter_type == "Full day free":
+                full_day = True
+                min_hrs = None
+            elif filter_type.startswith("Half"):
+                full_day = False
+                min_hrs = 4
+            else:
+                full_day = False
+                min_hrs = 1
+
+        results = query_availability(daily_df, day_name=day_name, month_name=month_name,
+                                     full_day=full_day, min_available_hrs=min_hrs)
+
+        # --- Show what we searched for ---
+        search_desc_parts = []
+        if day_name:
+            search_desc_parts.append(f"**{day_name}s**")
+        else:
+            search_desc_parts.append("**any weekday**")
+        if month_name:
+            search_desc_parts.append(f"in **{month_name}**")
+        if full_day:
+            search_desc_parts.append("with a **full day** free")
+        elif min_hrs:
+            search_desc_parts.append(f"with **{min_hrs}+ hours** free")
+
+        st.markdown(f"Showing {' '.join(search_desc_parts)}:")
+
+        if results.empty:
+            st.warning("No results found. Try broadening your search.")
+        else:
+            # --- Summary: who has the most available days ---
+            st.subheader("Results Summary")
+            summary = results.groupby("staff").agg(
+                free_days=("date_str", "count"),
+                total_free_hrs=("available_hrs", "sum"),
+            ).reset_index().sort_values("free_days", ascending=False)
+            summary.columns = ["Staff", "Free Days", "Total Free Hours"]
+
+            s1, s2 = st.columns([1, 2])
+            with s1:
+                st.dataframe(summary, use_container_width=True, hide_index=True)
+            with s2:
+                fig = px.bar(
+                    summary.sort_values("Free Days", ascending=True),
+                    y="Staff",
+                    x="Free Days",
+                    orientation="h",
+                    color="Free Days",
+                    color_continuous_scale=["#e74c3c", "#f1c40f", "#2ecc71"],
+                    labels={"Free Days": "Available Days"},
+                )
+                fig.update_layout(
+                    height=max(250, len(summary) * 40),
+                    margin=dict(l=0, r=0, t=10, b=0),
+                    showlegend=False,
+                    coloraxis_showscale=False,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            # --- Calendar grid: person x date heatmap ---
+            st.subheader("Day-by-Day View")
+            grid_pivot = results.pivot_table(
+                index="staff", columns="date_str", values="available_hrs",
+                aggfunc="first",
+            )
+            # Keep dates in order
+            date_order = sorted(grid_pivot.columns.tolist())
+            grid_pivot = grid_pivot.reindex(columns=date_order)
+
+            # Make short date labels
+            date_labels = []
+            for d in date_order:
+                from datetime import datetime as dt
+                parsed_date = dt.strptime(d, "%Y-%m-%d")
+                date_labels.append(parsed_date.strftime("%b %d\n%a"))
+
+            fig = go.Figure(data=go.Heatmap(
+                z=grid_pivot.values.tolist(),
+                x=date_labels,
+                y=grid_pivot.index.tolist(),
+                colorscale=[
+                    [0, "#e74c3c"],      # 0 hrs = red (busy)
+                    [0.5, "#f1c40f"],    # 4 hrs = yellow
+                    [1, "#2ecc71"],      # 8 hrs = green (free)
+                ],
+                zmin=0,
+                zmax=hours_per_day,
+                text=[[f"{v:.0f}h" if not pd.isna(v) else "" for v in row]
+                      for row in grid_pivot.values],
+                texttemplate="%{text}",
+                colorbar_title="Free Hrs",
+                hovertemplate=(
+                    "<b>%{y}</b><br>%{x}<br>"
+                    "Available: %{z:.1f} hrs<extra></extra>"
+                ),
+            ))
+            fig.update_layout(
+                height=max(300, len(grid_pivot) * 45 + 80),
+                margin=dict(l=0, r=0, t=10, b=0),
+                xaxis=dict(side="top"),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # --- Detailed table ---
+            with st.expander("Full detail table"):
+                detail = results[[
+                    "date_str", "day_name", "staff", "booked_hrs",
+                    "available_hrs",
+                ]].copy()
+                detail.columns = ["Date", "Day", "Staff", "Booked Hrs", "Available Hrs"]
+                st.dataframe(detail, use_container_width=True, hide_index=True)

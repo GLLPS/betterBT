@@ -157,6 +157,127 @@ def build_overall_staff_summary(weekly_df):
     return grouped.sort_values("avg_utilization", ascending=False)
 
 
+def build_daily_availability(hours_by_user, start_date, end_date, hours_per_day=8):
+    """Build a per-person, per-day availability table.
+
+    Returns a DataFrame with columns:
+        date, day_name, staff, email, booked_hrs, capacity_hrs, available_hrs, is_free
+    Only includes weekdays (Mon-Fri).
+    """
+    rows = []
+    current = start_date
+    while current < end_date:
+        if current.weekday() < 5:  # Mon-Fri
+            for email, data in hours_by_user.items():
+                if data.get("error"):
+                    continue
+                daily = data.get("daily_hours", {})
+                name = email.split("@")[0].replace(".", " ").title()
+                day_str = current.strftime("%Y-%m-%d")
+                booked = daily.get(day_str, 0)
+                available = max(0, hours_per_day - booked)
+                rows.append({
+                    "date": current,
+                    "date_str": day_str,
+                    "day_name": current.strftime("%A"),
+                    "month": current.strftime("%B"),
+                    "month_num": current.month,
+                    "year": current.year,
+                    "staff": name,
+                    "email": email,
+                    "booked_hrs": round(booked, 1),
+                    "capacity_hrs": hours_per_day,
+                    "available_hrs": round(available, 1),
+                    "is_free": booked < 1,  # Less than 1 hour booked = essentially free
+                })
+        current += timedelta(days=1)
+    return pd.DataFrame(rows)
+
+
+def query_availability(daily_df, day_name=None, month_name=None, full_day=True,
+                       min_available_hrs=None):
+    """Filter daily availability to answer questions like
+    'who has a full Thursday available in March'.
+
+    Args:
+        daily_df: DataFrame from build_daily_availability.
+        day_name: e.g. "Thursday" (optional, None = any day).
+        month_name: e.g. "March" (optional, None = any month).
+        full_day: If True, only return days where is_free is True.
+        min_available_hrs: Alternative to full_day — minimum free hours.
+
+    Returns:
+        Filtered DataFrame.
+    """
+    if daily_df.empty:
+        return daily_df
+
+    filtered = daily_df.copy()
+
+    if day_name:
+        filtered = filtered[filtered["day_name"].str.lower() == day_name.lower()]
+
+    if month_name:
+        filtered = filtered[filtered["month"].str.lower() == month_name.lower()]
+
+    if min_available_hrs is not None:
+        filtered = filtered[filtered["available_hrs"] >= min_available_hrs]
+    elif full_day:
+        filtered = filtered[filtered["is_free"]]
+
+    return filtered.sort_values(["date", "staff"])
+
+
+def parse_availability_query(query):
+    """Parse a natural-language availability query into structured filters.
+
+    Handles queries like:
+        'who has a full Thursday available in March'
+        'who is free on Fridays in April'
+        'available Mondays March'
+
+    Returns:
+        dict with keys: day_name, month_name, full_day, min_hours
+    """
+    q = query.lower().strip()
+    result = {"day_name": None, "month_name": None, "full_day": True, "min_hours": None}
+
+    days = {
+        "monday": "Monday", "tuesday": "Tuesday", "wednesday": "Wednesday",
+        "thursday": "Thursday", "friday": "Friday",
+        "mondays": "Monday", "tuesdays": "Tuesday", "wednesdays": "Wednesday",
+        "thursdays": "Thursday", "fridays": "Friday",
+    }
+    for key, val in days.items():
+        if key in q:
+            result["day_name"] = val
+            break
+
+    months = {
+        "january": "January", "february": "February", "march": "March",
+        "april": "April", "may": "May", "june": "June",
+        "july": "July", "august": "August", "september": "September",
+        "october": "October", "november": "November", "december": "December",
+    }
+    for key, val in months.items():
+        if key in q:
+            result["month_name"] = val
+            break
+
+    # Check for "half day" or hour thresholds
+    if "half" in q:
+        result["full_day"] = False
+        result["min_hours"] = 4
+    elif "full" in q or "whole" in q or "entire" in q or "all day" in q:
+        result["full_day"] = True
+    else:
+        # Default: show anyone with 4+ hours free
+        result["full_day"] = False
+        result["min_hours"] = 4
+
+    return result
+
+
 def load_calendar_data(outlook_client, start_date, end_date, hours_per_day=8):
     """Main entry point: fetch Outlook data and build all weekly views.
 
@@ -188,5 +309,6 @@ def load_calendar_data(outlook_client, start_date, end_date, hours_per_day=8):
     result["team_weekly"] = build_team_weekly_summary(weekly)
     result["staff_summary"] = build_overall_staff_summary(weekly)
     result["heatmap"] = build_weekly_heatmap_data(weekly)
+    result["daily"] = build_daily_availability(hours_by_user, start_date, end_date, hours_per_day)
 
     return result
