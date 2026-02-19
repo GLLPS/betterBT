@@ -1,335 +1,287 @@
-"""BetterBT — Staffing Dashboard
+"""BetterBT — Team Calendar Dashboard
 
-Pulls active projects from BigTime, compares time budgets against
-Outlook calendar availability, and displays a staffing dashboard.
+Connects to Outlook calendars and shows how busy the team is
+on a weekly basis over the coming months.
 
 Run with: streamlit run app.py
 """
 
 import streamlit as st
-import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
+import plotly.express as px
 from datetime import datetime, timedelta
 
-from config import BigTimeConfig, AzureConfig
-from bigtime_client import BigTimeClient
+from config import AzureConfig
 from outlook_client import OutlookClient
-from data_processor import load_all_data
+from data_processor import load_calendar_data
 
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="BetterBT — Staffing Dashboard",
-    page_icon="📊",
+    page_title="BetterBT — Team Calendar",
+    page_icon="📅",
     layout="wide",
 )
 
-st.title("BetterBT — Staffing Dashboard")
-st.caption("BigTime project budgets vs. Outlook calendar availability")
+st.title("BetterBT — Team Calendar")
+st.caption("Weekly staffing view from Outlook calendars")
 
 # ---------------------------------------------------------------------------
-# Sidebar — configuration & refresh
+# Sidebar
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("Settings")
 
-    weeks_ahead = st.slider("Weeks to look ahead", 1, 8, 2)
-    start_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    end_date = start_date + timedelta(weeks=weeks_ahead)
-
+    months_ahead = st.slider("Months to look ahead", 1, 6, 3)
     hours_per_day = st.number_input("Work hours per day", 4, 12, 8)
 
+    start_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    end_date = start_date + timedelta(weeks=months_ahead * 4 + 1)
+
     st.divider()
 
-    # Connection status indicators
-    bt_ok = bool(BigTimeConfig.API_TOKEN and BigTimeConfig.FIRM_ID) or bool(
-        BigTimeConfig.USERNAME and BigTimeConfig.PASSWORD
-    )
     outlook_ok = all([AzureConfig.TENANT_ID, AzureConfig.CLIENT_ID, AzureConfig.CLIENT_SECRET])
-
-    st.subheader("Connections")
-    st.write(f"BigTime: {'Connected' if bt_ok else 'Not configured'}")
-    st.write(f"Outlook: {'Connected' if outlook_ok else 'Not configured'}")
+    st.subheader("Connection")
+    if outlook_ok:
+        st.success("Outlook credentials configured")
+    else:
+        st.error("Outlook not configured")
 
     if AzureConfig.OUTLOOK_USERS:
-        st.write(f"Tracking {len(AzureConfig.OUTLOOK_USERS)} staff")
+        st.write(f"**{len(AzureConfig.OUTLOOK_USERS)} staff** tracked:")
+        for u in AzureConfig.OUTLOOK_USERS:
+            st.write(f"- {u}")
     else:
-        st.write("No staff emails configured")
+        st.warning("No staff emails in OUTLOOK_USERS")
 
     st.divider()
-    refresh = st.button("Refresh Data", use_container_width=True)
+    refresh = st.button("Refresh Data", type="primary", use_container_width=True)
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+if not outlook_ok:
+    st.warning(
+        "Outlook credentials not configured. "
+        "Copy `.env.example` to `.env`, fill in your Azure app credentials "
+        "and staff emails, then restart."
+    )
+    st.stop()
+
+if not AzureConfig.OUTLOOK_USERS:
+    st.warning(
+        "No staff emails configured. Add a comma-separated list to "
+        "`OUTLOOK_USERS` in your `.env` file."
+    )
+    st.stop()
 
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
-
-@st.cache_data(ttl=300, show_spinner="Loading data from BigTime & Outlook...")
-def cached_load(weeks, _hours_per_day):
-    """Load all data, cached for 5 minutes."""
-    bt_client = None
-    outlook_client = None
-
-    if bt_ok:
-        bt_client = BigTimeClient()
-        bt_client.authenticate()
-
-    if outlook_ok and AzureConfig.OUTLOOK_USERS:
-        outlook_client = OutlookClient()
-
+@st.cache_data(ttl=300, show_spinner="Fetching calendars...")
+def cached_load(_months, _hours_per_day):
     s = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    e = s + timedelta(weeks=weeks)
-
-    return load_all_data(bt_client, outlook_client, s, e)
+    e = s + timedelta(weeks=_months * 4 + 1)
+    client = OutlookClient()
+    return load_calendar_data(client, s, e, _hours_per_day)
 
 
 if refresh:
     st.cache_data.clear()
 
-if not bt_ok and not outlook_ok:
-    st.warning(
-        "No API credentials configured. Copy `.env.example` to `.env` and fill in your credentials, "
-        "then restart the app. See the README for setup instructions."
-    )
+data = cached_load(months_ahead, hours_per_day)
+
+for err in data["errors"]:
+    st.error(err)
+
+weekly_df = data["weekly"]
+team_df = data["team_weekly"]
+staff_df = data["staff_summary"]
+staff_names, week_labels, heatmap_z = data["heatmap"]
+
+if weekly_df.empty:
+    st.info("No calendar data returned. Verify credentials and staff list.")
     st.stop()
-
-with st.spinner("Loading data..."):
-    data = cached_load(weeks_ahead, hours_per_day)
-
-if data["errors"]:
-    for err in data["errors"]:
-        st.error(err)
 
 # ---------------------------------------------------------------------------
 # KPI row
 # ---------------------------------------------------------------------------
-projects_df = data["projects"]
-staffing_df = data["staffing"]
-capacity = data["capacity_summary"]
+num_weeks = len(team_df) if not team_df.empty else 0
+avg_util = team_df["avg_utilization"].mean() if not team_df.empty else 0
+total_booked = staff_df["total_booked"].sum() if not staff_df.empty else 0
+total_avail = staff_df["total_available"].sum() if not staff_df.empty else 0
 
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-    st.metric("Active Projects", len(projects_df) if not projects_df.empty else "—")
-with col2:
-    st.metric(
-        "Total Budget Hours Remaining",
-        f"{capacity.get('total_project_hours_remaining', '—'):,}" if capacity else "—",
-    )
-with col3:
-    st.metric(
-        "Staff Available Hours",
-        f"{capacity.get('total_staff_available_hours', '—'):,}" if capacity else "—",
-    )
-with col4:
-    gap = capacity.get("capacity_gap")
-    if gap is not None:
-        st.metric(
-            "Capacity Gap",
-            f"{abs(gap):,.1f} hrs",
-            delta=f"{'Under' if gap >= 0 else 'Over'} capacity",
-            delta_color="normal" if gap >= 0 else "inverse",
-        )
-    else:
-        st.metric("Capacity Gap", "—")
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Staff", len(AzureConfig.OUTLOOK_USERS))
+k2.metric("Weeks Shown", num_weeks)
+k3.metric("Avg Team Utilization", f"{avg_util:.0f}%")
+k4.metric("Total Available Hours", f"{total_avail:,.0f}")
 
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Tab layout
+# Main content: two tabs
 # ---------------------------------------------------------------------------
-tab_projects, tab_staff, tab_daily, tab_compare = st.tabs([
-    "Project Budgets", "Staff Utilization", "Daily Availability", "Budget vs. Capacity",
-])
+tab_team, tab_people = st.tabs(["Team Overview", "Individual Staff"])
 
-# ---------------------------------------------------------------------------
-# Tab 1: Project Budgets
-# ---------------------------------------------------------------------------
-with tab_projects:
-    if projects_df.empty:
-        st.info("No BigTime project data available. Check your BigTime credentials.")
-    else:
-        st.subheader("Active Projects — Budget Overview")
+# ====== Tab 1: Team Overview ===============================================
+with tab_team:
 
-        # Budget bar chart
-        chart_df = projects_df.sort_values("budget_hours", ascending=True).tail(20)
+    # --- Team utilization trend line ---
+    st.subheader("Team Utilization by Week")
+    if not team_df.empty:
         fig = go.Figure()
         fig.add_trace(go.Bar(
-            y=chart_df["project_name"],
-            x=chart_df["hours_logged"],
-            name="Hours Logged",
-            orientation="h",
+            x=team_df["week_label"],
+            y=team_df["team_booked"],
+            name="Booked Hours",
             marker_color="#636EFA",
         ))
         fig.add_trace(go.Bar(
-            y=chart_df["project_name"],
-            x=chart_df["hours_remaining"],
-            name="Hours Remaining",
-            orientation="h",
-            marker_color="#EF553B",
+            x=team_df["week_label"],
+            y=team_df["team_available"],
+            name="Available Hours",
+            marker_color="#2ecc71",
+        ))
+        fig.add_trace(go.Scatter(
+            x=team_df["week_label"],
+            y=team_df["avg_utilization"],
+            name="Utilization %",
+            yaxis="y2",
+            mode="lines+markers",
+            line=dict(color="#e74c3c", width=2),
+            marker=dict(size=6),
         ))
         fig.update_layout(
             barmode="stack",
-            height=max(400, len(chart_df) * 30),
-            margin=dict(l=0, r=0, t=30, b=0),
+            yaxis=dict(title="Hours"),
+            yaxis2=dict(title="Utilization %", overlaying="y", side="right",
+                        range=[0, 100], showgrid=False),
             legend=dict(orientation="h", yanchor="bottom", y=1.02),
-            xaxis_title="Hours",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Project table
-        st.subheader("Project Details")
-        display_df = projects_df[[
-            "project_name", "project_code", "budget_hours",
-            "hours_logged", "hours_remaining", "task_count",
-        ]].copy()
-        display_df.columns = [
-            "Project", "Code", "Budget Hrs", "Logged Hrs", "Remaining Hrs", "Tasks",
-        ]
-        st.dataframe(
-            display_df.sort_values("Remaining Hrs", ascending=False),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-# ---------------------------------------------------------------------------
-# Tab 2: Staff Utilization
-# ---------------------------------------------------------------------------
-with tab_staff:
-    if staffing_df.empty:
-        st.info("No Outlook calendar data available. Check your Azure/Outlook credentials.")
-    else:
-        st.subheader(f"Staff Utilization — Next {weeks_ahead} Week(s)")
-
-        # Utilization bar chart
-        fig = px.bar(
-            staffing_df.sort_values("utilization_pct", ascending=True),
-            y="staff",
-            x="utilization_pct",
-            orientation="h",
-            color="utilization_pct",
-            color_continuous_scale=["#2ecc71", "#f1c40f", "#e74c3c"],
-            range_color=[0, 100],
-            labels={"utilization_pct": "Utilization %", "staff": ""},
-        )
-        fig.update_layout(
-            height=max(300, len(staffing_df) * 40),
+            height=400,
             margin=dict(l=0, r=0, t=30, b=0),
-            coloraxis_colorbar_title="Utilization %",
         )
-        fig.add_vline(x=80, line_dash="dash", line_color="gray", annotation_text="80% target")
         st.plotly_chart(fig, use_container_width=True)
 
-        # Staffing table
-        st.subheader("Staff Details")
-        display_staff = staffing_df[[
-            "staff", "booked_hours", "available_hours", "capacity_hours", "utilization_pct",
-        ]].copy()
-        display_staff.columns = [
-            "Staff", "Booked Hrs", "Available Hrs", "Capacity Hrs", "Utilization %",
-        ]
-        st.dataframe(display_staff, use_container_width=True, hide_index=True)
-
-# ---------------------------------------------------------------------------
-# Tab 3: Daily Availability
-# ---------------------------------------------------------------------------
-with tab_daily:
-    daily_df = data["daily_availability"]
-    if daily_df.empty:
-        st.info("No daily availability data. Check Outlook credentials and staff list.")
-    else:
-        st.subheader("Daily Available Hours by Staff Member")
-
-        # Heatmap
-        date_col = daily_df["date"]
-        staff_cols = [c for c in daily_df.columns if c != "date"]
-        heatmap_data = daily_df[staff_cols].values.T
-
+    # --- Heatmap: person x week ---
+    st.subheader("Who's Busy When")
+    if staff_names and week_labels:
         fig = go.Figure(data=go.Heatmap(
-            z=heatmap_data,
-            x=date_col,
-            y=staff_cols,
-            colorscale=[[0, "#e74c3c"], [0.5, "#f1c40f"], [1, "#2ecc71"]],
+            z=heatmap_z,
+            x=week_labels,
+            y=staff_names,
+            colorscale=[
+                [0, "#2ecc71"],      # 0% = green (free)
+                [0.5, "#f1c40f"],    # 50% = yellow
+                [0.8, "#e67e22"],    # 80% = orange
+                [1, "#e74c3c"],      # 100% = red (slammed)
+            ],
             zmin=0,
-            zmax=hours_per_day,
-            text=heatmap_data,
-            texttemplate="%{text:.1f}",
-            colorbar_title="Avail Hrs",
+            zmax=100,
+            text=[[f"{v:.0f}%" for v in row] for row in heatmap_z],
+            texttemplate="%{text}",
+            colorbar_title="Util %",
+            hovertemplate="<b>%{y}</b><br>Week of %{x}<br>Utilization: %{z:.0f}%<extra></extra>",
         ))
         fig.update_layout(
-            height=max(300, len(staff_cols) * 50),
-            margin=dict(l=0, r=0, t=30, b=0),
-            xaxis_title="Date",
+            height=max(300, len(staff_names) * 45 + 80),
+            margin=dict(l=0, r=0, t=10, b=0),
+            xaxis=dict(side="top"),
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # Raw table
-        with st.expander("Raw daily data"):
-            st.dataframe(daily_df, use_container_width=True, hide_index=True)
+    # --- Weekly detail table ---
+    with st.expander("Weekly numbers"):
+        if not team_df.empty:
+            display = team_df[[
+                "week_label", "team_booked", "team_capacity",
+                "team_available", "staff_count", "avg_utilization",
+            ]].copy()
+            display.columns = [
+                "Week Of", "Booked Hrs", "Capacity Hrs",
+                "Available Hrs", "Staff", "Avg Util %",
+            ]
+            st.dataframe(display, use_container_width=True, hide_index=True)
 
-# ---------------------------------------------------------------------------
-# Tab 4: Budget vs. Capacity Comparison
-# ---------------------------------------------------------------------------
-with tab_compare:
-    if projects_df.empty or staffing_df.empty:
-        st.info(
-            "Need both BigTime and Outlook data for comparison. "
-            "Configure both connections in your .env file."
+
+# ====== Tab 2: Individual Staff ============================================
+with tab_people:
+
+    st.subheader("Staff Summary")
+
+    if not staff_df.empty:
+        # Overall bar chart
+        sorted_staff = staff_df.sort_values("avg_utilization", ascending=True)
+        fig = px.bar(
+            sorted_staff,
+            y="staff",
+            x="avg_utilization",
+            orientation="h",
+            color="avg_utilization",
+            color_continuous_scale=["#2ecc71", "#f1c40f", "#e74c3c"],
+            range_color=[0, 100],
+            labels={"avg_utilization": "Avg Utilization %", "staff": ""},
         )
-    else:
-        st.subheader("Project Budget Hours vs. Staff Capacity")
+        fig.add_vline(x=80, line_dash="dash", line_color="gray",
+                       annotation_text="80% target")
+        fig.update_layout(
+            height=max(300, len(sorted_staff) * 40),
+            margin=dict(l=0, r=0, t=30, b=0),
+            coloraxis_colorbar_title="Util %",
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-        # Summary gauges
-        c1, c2 = st.columns(2)
-        with c1:
-            total_remaining = capacity["total_project_hours_remaining"]
-            fig = go.Figure(go.Indicator(
-                mode="gauge+number",
-                value=total_remaining,
-                title={"text": "Hours of Work Remaining"},
-                gauge={
-                    "axis": {"range": [0, max(total_remaining * 1.5, 100)]},
-                    "bar": {"color": "#636EFA"},
-                },
-            ))
-            fig.update_layout(height=250, margin=dict(l=20, r=20, t=50, b=0))
-            st.plotly_chart(fig, use_container_width=True)
-
-        with c2:
-            total_avail = capacity["total_staff_available_hours"]
-            fig = go.Figure(go.Indicator(
-                mode="gauge+number",
-                value=total_avail,
-                title={"text": "Staff Available Hours"},
-                gauge={
-                    "axis": {"range": [0, max(total_avail * 1.5, 100)]},
-                    "bar": {"color": "#2ecc71"},
-                },
-            ))
-            fig.update_layout(height=250, margin=dict(l=20, r=20, t=50, b=0))
-            st.plotly_chart(fig, use_container_width=True)
-
-        # Gap analysis
-        gap = capacity["capacity_gap"]
-        if gap >= 0:
-            st.success(
-                f"You have **{gap:,.1f} hours** of spare capacity across "
-                f"{capacity['staff_count']} staff for "
-                f"{capacity['project_count']} active projects."
-            )
-        else:
-            st.error(
-                f"You are **{abs(gap):,.1f} hours over capacity** across "
-                f"{capacity['staff_count']} staff for "
-                f"{capacity['project_count']} active projects. "
-                "Consider reassigning work or extending timelines."
-            )
-
-        # Projects ranked by urgency (least remaining hours first)
-        st.subheader("Projects by Urgency (least remaining hours)")
-        urgent_df = projects_df.nsmallest(10, "hours_remaining")[[
-            "project_name", "budget_hours", "hours_logged", "hours_remaining",
+        # Summary table
+        display = staff_df[[
+            "staff", "total_booked", "total_capacity",
+            "total_available", "weeks", "avg_utilization",
         ]].copy()
-        urgent_df.columns = ["Project", "Budget Hrs", "Logged Hrs", "Remaining Hrs"]
-        st.dataframe(urgent_df, use_container_width=True, hide_index=True)
+        display.columns = [
+            "Staff", "Booked Hrs", "Capacity Hrs",
+            "Available Hrs", "Weeks", "Avg Util %",
+        ]
+        st.dataframe(display, use_container_width=True, hide_index=True)
+
+    # Per-person weekly breakdown
+    st.subheader("Weekly Breakdown by Person")
+
+    if not weekly_df.empty:
+        selected = st.selectbox(
+            "Select staff member",
+            options=sorted(weekly_df["staff"].unique()),
+        )
+        person_df = weekly_df[weekly_df["staff"] == selected]
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=person_df["week_label"],
+            y=person_df["booked_hrs"],
+            name="Booked",
+            marker_color="#636EFA",
+        ))
+        fig.add_trace(go.Bar(
+            x=person_df["week_label"],
+            y=person_df["available_hrs"],
+            name="Available",
+            marker_color="#2ecc71",
+        ))
+        fig.update_layout(
+            barmode="stack",
+            yaxis_title="Hours",
+            height=350,
+            margin=dict(l=0, r=0, t=30, b=0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        with st.expander(f"{selected} — weekly detail"):
+            detail = person_df[[
+                "week_label", "booked_hrs", "capacity_hrs",
+                "available_hrs", "utilization_pct",
+            ]].copy()
+            detail.columns = [
+                "Week Of", "Booked Hrs", "Capacity Hrs",
+                "Available Hrs", "Utilization %",
+            ]
+            st.dataframe(detail, use_container_width=True, hide_index=True)

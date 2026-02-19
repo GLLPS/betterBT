@@ -1,43 +1,15 @@
-"""Data processing layer: merges BigTime project/budget data with Outlook calendar data."""
+"""Data processing: aggregates Outlook calendar events into weekly staffing views."""
 
 import asyncio
 from datetime import datetime, timedelta
+from collections import defaultdict
 import pandas as pd
 
-from bigtime_client import BigTimeClient
 from outlook_client import OutlookClient
 
 
-def fetch_bigtime_data(bt_client):
-    """Fetch and structure all BigTime project + budget data.
-
-    Returns a DataFrame with one row per project.
-    """
-    summaries = bt_client.get_all_project_summaries()
-
-    rows = []
-    for proj in summaries:
-        rows.append({
-            "project_id": proj["ProjectSid"],
-            "project_name": proj["ProjectName"],
-            "project_code": proj["ProjectCode"],
-            "start_date": proj["StartDate"],
-            "end_date": proj["EndDate"],
-            "budget_hours": proj["BudgetHours"],
-            "hours_logged": proj["HoursLogged"],
-            "hours_remaining": proj["HoursRemaining"],
-            "task_count": len(proj["Tasks"]),
-        })
-
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        for col in ["start_date", "end_date"]:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
-    return df
-
-
-async def fetch_outlook_data(outlook_client, start_date=None, end_date=None):
-    """Fetch and structure Outlook calendar data for all configured users.
+async def fetch_outlook_data(outlook_client, start_date, end_date):
+    """Fetch calendar events for all configured users.
 
     Returns:
         events_by_user: Dict of email -> list of event dicts.
@@ -55,129 +27,166 @@ async def fetch_outlook_data(outlook_client, start_date=None, end_date=None):
     return events_by_user, hours_by_user
 
 
-def build_staffing_summary(hours_by_user, num_workdays=10, hours_per_day=8):
-    """Build a staffing summary from Outlook calendar data.
+def _get_week_mondays(start_date, end_date):
+    """Generate a list of Monday dates covering start_date through end_date."""
+    # Roll start back to its Monday
+    current = start_date - timedelta(days=start_date.weekday())
+    mondays = []
+    while current < end_date:
+        mondays.append(current)
+        current += timedelta(weeks=1)
+    return mondays
 
-    Args:
-        hours_by_user: Dict from fetch_outlook_data.
-        num_workdays: Number of workdays in the period.
-        hours_per_day: Work hours per day.
 
-    Returns:
-        DataFrame with columns: staff, booked_hours, available_hours, utilization_pct.
+def _workdays_in_week(monday, start_date, end_date):
+    """Count workdays (Mon-Fri) in a given week, clamped to the overall range."""
+    count = 0
+    for d in range(5):  # Mon-Fri
+        day = monday + timedelta(days=d)
+        if start_date <= day < end_date:
+            count += 1
+    return count
+
+
+def build_weekly_hours(hours_by_user, start_date, end_date, hours_per_day=8):
+    """Aggregate daily booked hours into weekly buckets per person.
+
+    Returns a DataFrame with columns:
+        week_of (Monday date), staff, email, booked_hrs, capacity_hrs,
+        available_hrs, utilization_pct
     """
-    total_capacity = num_workdays * hours_per_day
+    mondays = _get_week_mondays(start_date, end_date)
     rows = []
 
     for email, data in hours_by_user.items():
-        booked = data.get("total_hours", 0)
-        available = max(0, total_capacity - booked)
-        utilization = (booked / total_capacity * 100) if total_capacity > 0 else 0
+        if data.get("error"):
+            continue
 
-        rows.append({
-            "staff": email.split("@")[0].replace(".", " ").title(),
-            "email": email,
-            "booked_hours": round(booked, 1),
-            "available_hours": round(available, 1),
-            "capacity_hours": total_capacity,
-            "utilization_pct": round(utilization, 1),
-            "error": data.get("error"),
-        })
+        daily = data.get("daily_hours", {})
+        name = email.split("@")[0].replace(".", " ").title()
 
-    return pd.DataFrame(rows)
+        for monday in mondays:
+            workdays = _workdays_in_week(monday, start_date, end_date)
+            capacity = workdays * hours_per_day
 
+            # Sum booked hours for Mon-Fri of this week
+            booked = 0.0
+            for d in range(5):
+                day_str = (monday + timedelta(days=d)).strftime("%Y-%m-%d")
+                booked += daily.get(day_str, 0)
 
-def build_project_vs_capacity(project_df, staffing_df):
-    """Compare project hours remaining against available staff capacity.
+            available = max(0, capacity - booked)
+            util = (booked / capacity * 100) if capacity > 0 else 0
 
-    Returns a summary dict.
-    """
-    total_budget_remaining = project_df["hours_remaining"].sum() if not project_df.empty else 0
-    total_available = staffing_df["available_hours"].sum() if not staffing_df.empty else 0
-    staff_count = len(staffing_df) if not staffing_df.empty else 0
-
-    gap = total_available - total_budget_remaining
-
-    return {
-        "total_project_hours_remaining": round(total_budget_remaining, 1),
-        "total_staff_available_hours": round(total_available, 1),
-        "capacity_gap": round(gap, 1),
-        "gap_status": "Over capacity" if gap < 0 else "Under capacity",
-        "staff_count": staff_count,
-        "project_count": len(project_df) if not project_df.empty else 0,
-    }
-
-
-def get_daily_availability(hours_by_user, start_date=None, num_days=10, hours_per_day=8):
-    """Build a daily availability table across all staff.
-
-    Returns a DataFrame with dates as rows, staff as columns,
-    values = available hours that day.
-    """
-    if start_date is None:
-        start_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-
-    dates = []
-    current = start_date
-    for _ in range(num_days):
-        if current.weekday() < 5:  # Monday-Friday
-            dates.append(current.strftime("%Y-%m-%d"))
-        current += timedelta(days=1)
-        # Keep going until we have enough workdays
-        while current.weekday() >= 5:
-            current += timedelta(days=1)
-
-    rows = []
-    for date_str in dates:
-        row = {"date": date_str}
-        for email, data in hours_by_user.items():
-            name = email.split("@")[0].replace(".", " ").title()
-            booked = data.get("daily_hours", {}).get(date_str, 0)
-            row[name] = round(max(0, hours_per_day - booked), 1)
-        rows.append(row)
+            rows.append({
+                "week_of": monday.strftime("%Y-%m-%d"),
+                "week_label": f"{monday.strftime('%b %d')}",
+                "staff": name,
+                "email": email,
+                "booked_hrs": round(booked, 1),
+                "capacity_hrs": capacity,
+                "available_hrs": round(available, 1),
+                "utilization_pct": round(util, 1),
+            })
 
     return pd.DataFrame(rows)
 
 
-def load_all_data(bt_client=None, outlook_client=None, start_date=None, end_date=None):
-    """Main entry point: load all data from both sources.
+def build_team_weekly_summary(weekly_df):
+    """Aggregate individual weekly data into team-level weekly totals.
 
-    Returns a dict with all processed data ready for the dashboard.
+    Returns a DataFrame with one row per week: total booked, capacity,
+    available, avg utilization.
+    """
+    if weekly_df.empty:
+        return pd.DataFrame()
+
+    grouped = weekly_df.groupby(["week_of", "week_label"], sort=True).agg(
+        team_booked=("booked_hrs", "sum"),
+        team_capacity=("capacity_hrs", "sum"),
+        team_available=("available_hrs", "sum"),
+        staff_count=("staff", "count"),
+    ).reset_index()
+
+    grouped["avg_utilization"] = (
+        grouped["team_booked"] / grouped["team_capacity"] * 100
+    ).round(1)
+
+    return grouped
+
+
+def build_weekly_heatmap_data(weekly_df):
+    """Pivot weekly data into a staff x week matrix of utilization %.
+
+    Returns (staff_names, week_labels, z_values) ready for a heatmap.
+    """
+    if weekly_df.empty:
+        return [], [], []
+
+    pivot = weekly_df.pivot_table(
+        index="staff", columns="week_label", values="utilization_pct",
+        aggfunc="first",
+    )
+    # Preserve chronological week order
+    week_order = weekly_df.drop_duplicates("week_label")["week_label"].tolist()
+    pivot = pivot.reindex(columns=week_order)
+
+    return pivot.index.tolist(), pivot.columns.tolist(), pivot.values.tolist()
+
+
+def build_overall_staff_summary(weekly_df):
+    """Per-person summary across the full period.
+
+    Returns a DataFrame with one row per person: total booked, capacity,
+    avg utilization.
+    """
+    if weekly_df.empty:
+        return pd.DataFrame()
+
+    grouped = weekly_df.groupby(["staff", "email"]).agg(
+        total_booked=("booked_hrs", "sum"),
+        total_capacity=("capacity_hrs", "sum"),
+        total_available=("available_hrs", "sum"),
+        weeks=("week_of", "count"),
+    ).reset_index()
+
+    grouped["avg_utilization"] = (
+        grouped["total_booked"] / grouped["total_capacity"] * 100
+    ).round(1)
+
+    return grouped.sort_values("avg_utilization", ascending=False)
+
+
+def load_calendar_data(outlook_client, start_date, end_date, hours_per_day=8):
+    """Main entry point: fetch Outlook data and build all weekly views.
+
+    Returns a dict with all processed data for the dashboard.
     """
     result = {
-        "projects": pd.DataFrame(),
-        "staffing": pd.DataFrame(),
-        "daily_availability": pd.DataFrame(),
-        "capacity_summary": {},
-        "hours_by_user": {},
-        "events_by_user": {},
+        "weekly": pd.DataFrame(),
+        "team_weekly": pd.DataFrame(),
+        "staff_summary": pd.DataFrame(),
+        "heatmap": ([], [], []),
         "errors": [],
     }
 
-    # BigTime data
-    if bt_client:
-        try:
-            result["projects"] = fetch_bigtime_data(bt_client)
-        except Exception as e:
-            result["errors"].append(f"BigTime error: {e}")
-
-    # Outlook data
-    if outlook_client:
-        try:
-            events_by_user, hours_by_user = asyncio.run(
-                fetch_outlook_data(outlook_client, start_date, end_date)
-            )
-            result["events_by_user"] = events_by_user
-            result["hours_by_user"] = hours_by_user
-            result["staffing"] = build_staffing_summary(hours_by_user)
-            result["daily_availability"] = get_daily_availability(hours_by_user, start_date)
-        except Exception as e:
-            result["errors"].append(f"Outlook error: {e}")
-
-    # Cross-source comparison
-    if not result["projects"].empty and not result["staffing"].empty:
-        result["capacity_summary"] = build_project_vs_capacity(
-            result["projects"], result["staffing"]
+    try:
+        events_by_user, hours_by_user = asyncio.run(
+            fetch_outlook_data(outlook_client, start_date, end_date)
         )
+    except Exception as e:
+        result["errors"].append(f"Outlook API error: {e}")
+        return result
+
+    # Check for per-user errors
+    for email, data in hours_by_user.items():
+        if data.get("error"):
+            result["errors"].append(f"{email}: {data['error']}")
+
+    weekly = build_weekly_hours(hours_by_user, start_date, end_date, hours_per_day)
+    result["weekly"] = weekly
+    result["team_weekly"] = build_team_weekly_summary(weekly)
+    result["staff_summary"] = build_overall_staff_summary(weekly)
+    result["heatmap"] = build_weekly_heatmap_data(weekly)
 
     return result

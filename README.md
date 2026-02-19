@@ -1,14 +1,14 @@
-# BetterBT — Staffing Dashboard
+# BetterBT — Team Calendar Dashboard
 
-Pulls active projects from BigTime, compares time budgets against Outlook
-calendar availability, and displays a staffing dashboard.
+Connects to your team's Outlook calendars via Microsoft Graph and shows
+how busy everyone is on a **weekly basis** over the next few months.
 
 ## Features
 
-- **Project Budgets**: View all active BigTime projects with budget hours, hours logged, and hours remaining
-- **Staff Utilization**: See each team member's calendar utilization from Outlook
-- **Daily Availability**: Heatmap showing available hours per person per day
-- **Budget vs. Capacity**: Compare total project hours remaining against total staff availability
+- **Team Overview**: stacked bar chart of booked vs. available hours per week, with a utilization % trend line
+- **Who's Busy When**: color-coded heatmap (person x week) — green = free, red = slammed
+- **Individual Staff**: per-person utilization bar, summary table, and weekly drill-down
+- Configurable look-ahead (1–6 months) and work-hours-per-day
 
 ## Quick Start
 
@@ -26,7 +26,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` and fill in your credentials (see sections below).
+Edit `.env` with your Azure app registration details and team emails.
 
 ### 3. Run the dashboard
 
@@ -34,37 +34,26 @@ Edit `.env` and fill in your credentials (see sections below).
 streamlit run app.py
 ```
 
-## BigTime Setup
-
-You need either a **firm API token** (recommended) or user credentials.
-
-### Firm API Token (permanent)
-1. Log into BigTime as a system admin
-2. Go to admin settings and create a firm access token
-3. Set `BIGTIME_API_TOKEN` and `BIGTIME_FIRM_ID` in `.env`
-
-### User Credentials (expires after 7 days)
-1. Set `BIGTIME_USERNAME` and `BIGTIME_PASSWORD` in `.env`
-
 ## Outlook / Microsoft Graph Setup
 
-1. Go to [Azure Portal](https://portal.azure.com) > App registrations > New registration
+1. Go to [Azure Portal](https://portal.azure.com) > Microsoft Entra ID > App registrations > **New registration**
 2. Copy the **Application (client) ID** and **Directory (tenant) ID**
-3. Under Certificates & secrets, create a new client secret
-4. Under API permissions, add these **Application** permissions:
+3. Under **Certificates & secrets**, create a new client secret
+4. Under **API permissions**, add these **Application** permissions:
    - `Calendars.Read`
    - `Schedule.Read.All`
 5. Click **Grant admin consent**
-6. Set `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` in `.env`
-7. Set `OUTLOOK_USERS` to a comma-separated list of staff email addresses
+6. Fill in `.env`:
+   - `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`
+   - `OUTLOOK_USERS` — comma-separated list of staff email addresses to track
 
 ## Project Structure
 
 ```
 app.py              — Streamlit dashboard (entry point)
-bigtime_client.py   — BigTime REST API v2 client
 outlook_client.py   — Microsoft Graph calendar client
-data_processor.py   — Merges BigTime + Outlook data
+data_processor.py   — Weekly aggregation and summaries
 config.py           — Loads settings from .env
 .env.example        — Template for environment variables
+bigtime_client.py   — BigTime API client (on hold, for future use)
 ```
